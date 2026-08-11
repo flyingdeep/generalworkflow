@@ -66,14 +66,37 @@ def list_instances(client: Client, limit: int = 100) -> list[dict]:
 def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[float] | None:
     """获取实例过去一段时间的 GPU 使用率数据。"""
     try:
-        resp = client.ucompshare().get_comp_share_instance_monitor(
-            UHostIds=[uhost_id]
-        )
-        if resp.get("RetCode") != 0:
-            logger.warning(f"[{uhost_id}] Monitor API failed: {resp.get('Message')}")
+        import requests
+        import hmac
+        import hashlib
+        import base64
+        
+        public_key = os.environ.get("COMPSHARE_PUBLIC_KEY", "")
+        private_key = os.environ.get("COMPSHARE_PRIVATE_KEY", "")
+        
+        # 使用 UCloud 数组格式：UHostIds.0=xxx
+        form_data = {
+            "Action": "GetCompShareInstanceMonitor",
+            "PublicKey": public_key,
+            "Timestamp": str(int(time.time())),
+            "Version": "2018-01-01",
+            "UHostIds.0": uhost_id
+        }
+        
+        # 计算签名
+        sorted_params = sorted(form_data.items())
+        canonical = "POST\n" + "&".join(f"{k}={v}" for k, v in sorted_params)
+        sig = hmac.new(private_key.encode(), canonical.encode(), hashlib.sha1).digest()
+        form_data["Signature"] = base64.b64encode(sig).decode()
+        
+        resp = requests.post(API_BASE_URL, data=form_data)
+        result = resp.json()
+        
+        if result.get("RetCode") != 0:
+            logger.warning(f"[{uhost_id}] Monitor API failed: {result.get('Message')}")
             return None
         
-        data = resp.get("Data", {})
+        data = result.get("Data", {})
         lst = data.get("List", [])
         if not lst:
             logger.warning(f"[{uhost_id}] No monitor data returned")
@@ -95,7 +118,7 @@ def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[flo
         
         return gpu_values if gpu_values else None
         
-    except exc.UCloudException as e:
+    except Exception as e:
         logger.warning(f"[{uhost_id}] Monitor API exception: {e}")
         return None
 

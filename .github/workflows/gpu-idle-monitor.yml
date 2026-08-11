@@ -1,0 +1,27 @@
+name: gpu-idle-monitor
+
+on:
+  schedule:
+    # 每小时执行一次（UTC 时间，避开整点前5分钟避免与 keepalive 冲突）
+    - cron: "5 * * * *"
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --upgrade ucloud-sdk-python3
+
+      - name: Run GPU idle monitor
+        env:
+          COMPSHARE_PUBLIC_KEY: ${{ secrets.COMPSHARE_PUBLIC_KEY }}
+          COMPSHARE_PRIVATE_KEY: ${{ secrets.COMPSHARE_PRIVATE_KEY }}
+        run: python scripts/gpu_idle_monitor.py

@@ -66,9 +66,10 @@ def list_instances(client: Client, limit: int = 100) -> list[dict]:
 def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[float] | None:
     """获取实例过去一段时间的 GPU 使用率数据。"""
     try:
-        resp = client.ucompshare().invoke(
-            "GetCompShareInstanceMonitor",
-            {"Region": region, "UHostIds": [uhost_id]},
+        # 使用SDK自动生成方法而非invoke，避免数组参数序列化问题
+        resp = client.ucompshare().get_comp_share_instance_monitor(
+            Region=region,
+            UHostIds=[uhost_id]
         )
         if resp.get("RetCode") != 0:
             logger.warning(f"[{uhost_id}] Monitor API failed: {resp.get('Message')}")

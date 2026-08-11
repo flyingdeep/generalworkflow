@@ -66,51 +66,15 @@ def list_instances(client: Client, limit: int = 100) -> list[dict]:
 def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[float] | None:
     """获取实例过去一段时间的 GPU 使用率数据。"""
     try:
-        import requests
-        import hmac
-        import hashlib
-        import base64
-        
-        public_key = os.environ.get("COMPSHARE_PUBLIC_KEY", "")
-        private_key = os.environ.get("COMPSHARE_PRIVATE_KEY", "")
-        
-        # UCloud API 签名算法：
-        # 1. 按参数名排序
-        # 2. 拼接成 canonical string: "POST\nParam1=Value1&Param2=Value2..."
-        # 3. HMAC-SHA1 签名后 Base64 编码
-        
-        timestamp = str(int(time.time()))
-        params = {
-            "Action": "GetCompShareInstanceMonitor",
-            "PublicKey": public_key,
-            "Timestamp": timestamp,
-            "Version": "2018-01-01",
-        }
-        
-        # 尝试不同的 UHostIds 格式
-        # UCloud 数组参数通常用 UHostIds.0, UHostIds.1 格式
-        params["UHostIds.0"] = uhost_id
-        
-        # 排序并拼接
-        sorted_params = sorted(params.items())
-        canonical = "POST\n" + "&".join(f"{k}={v}" for k, v in sorted_params)
-        
-        # 签名
-        sig = hmac.new(
-            private_key.encode("utf-8"),
-            canonical.encode("utf-8"),
-            hashlib.sha1
-        ).digest()
-        params["Signature"] = base64.b64encode(sig).decode("utf-8")
-        
-        resp = requests.post(API_BASE_URL, data=params)
-        result = resp.json()
-        
-        if result.get("RetCode") != 0:
-            logger.warning(f"[{uhost_id}] Monitor API failed: {result.get('Message')}")
+        resp = client.ucompshare().invoke(
+            "GetCompShareInstanceMonitor",
+            {"Region": region, "UHostIds": [uhost_id]},
+        )
+        if resp.get("RetCode") != 0:
+            logger.warning(f"[{uhost_id}] Monitor API failed: {resp.get('Message')}")
             return None
         
-        data = result.get("Data", {})
+        data = resp.get("Data", {})
         lst = data.get("List", [])
         if not lst:
             logger.warning(f"[{uhost_id}] No monitor data returned")
@@ -132,7 +96,7 @@ def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[flo
         
         return gpu_values if gpu_values else None
         
-    except Exception as e:
+    except exc.UCloudException as e:
         logger.warning(f"[{uhost_id}] Monitor API exception: {e}")
         return None
 

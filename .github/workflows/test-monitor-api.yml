@@ -1,0 +1,100 @@
+name: test-monitor-api
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install dependencies
+        run: pip install --upgrade ucloud-sdk-python3
+      
+      - name: Test Monitor API
+        env:
+          COMPSHARE_PUBLIC_KEY: ${{ secrets.COMPSHARE_PUBLIC_KEY }}
+          COMPSHARE_PRIVATE_KEY: ${{ secrets.COMPSHARE_PRIVATE_KEY }}
+        run: |
+          cat > /tmp/test_monitor.py << 'EOF'
+          import os, sys
+          from ucloud.core import exc
+          from ucloud.client import Client
+          
+          client = Client({
+              "region": "",
+              "public_key": os.environ["COMPSHARE_PUBLIC_KEY"],
+              "private_key": os.environ["COMPSHARE_PRIVATE_KEY"],
+              "base_url": "https://api.compshare.cn",
+          })
+          
+          # Step 1: List instances
+          resp = client.ucompshare().invoke("DescribeCompShareInstance", {"Limit": 100})
+          if resp.get("RetCode") != 0:
+              print(f"ERROR: {resp.get('Message')}")
+              sys.exit(1)
+          
+          instances = resp.get("UHostSet", [])
+          print(f"Total instances: {len(instances)}")
+          for inst in instances:
+              print(f"  {inst.get('UHostId')} | {inst.get('Name')} | {inst.get('State')} | {inst.get('Region')}/{inst.get('Zone')}")
+          
+          # Step 2: Test monitor API for running instances
+          print("\nTesting GetCompShareInstanceMonitor for running instances:")
+          for inst in instances:
+              if inst.get("State") != "Running":
+                  continue
+              
+              uhost_id = inst.get("UHostId")
+              region = inst.get("Region")
+              name = inst.get("Name")
+              
+              print(f"\nTesting {uhost_id} ({name}) in {region}...")
+              try:
+                  monitor_resp = client.ucompshare().invoke(
+                      "GetCompShareInstanceMonitor",
+                      {"Region": region, "UHostIds": [uhost_id]}
+                  )
+                  if monitor_resp.get("RetCode") != 0:
+                      print(f"  ERROR: {monitor_resp.get('Message')}")
+                      continue
+                  
+                  data = monitor_resp.get("Data", {})
+                  lst = data.get("List", [])
+                  if not lst:
+                      print(f"  No data returned")
+                      continue
+                  
+                  inst_data = lst[0]
+                  metrics = inst_data.get("Metrics", [])
+                  print(f"  Metrics found: {[m.get('MetricKey') for m in metrics]}")
+                  
+                  for metric in metrics:
+                      key = metric.get("MetricKey")
+                      results = metric.get("Results", [])
+                      if results:
+                          values = results[0].get("Values", [])
+                          print(f"  {key}: {len(values)} data points")
+                          if values:
+                              ts_first = values[0].get("Timestamp")
+                              val_first = values[0].get("Value")
+                              ts_last = values[-1].get("Timestamp")
+                              val_last = values[-1].get("Value")
+                              print(f"    First: {val_first}@{ts_first}")
+                              print(f"    Last: {val_last}@{ts_last}")
+                  
+              except exc.UCloudException as e:
+                  print(f"  Exception: {e}")
+              
+              import time
+              time.sleep(1)
+          
+          print("\nTest complete!")
+          EOF
+          python /tmp/test_monitor.py

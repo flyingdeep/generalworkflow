@@ -74,22 +74,36 @@ def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[flo
         public_key = os.environ.get("COMPSHARE_PUBLIC_KEY", "")
         private_key = os.environ.get("COMPSHARE_PRIVATE_KEY", "")
         
-        # 使用 UCloud 数组格式：UHostIds.0=xxx
-        form_data = {
+        # UCloud API 签名算法：
+        # 1. 按参数名排序
+        # 2. 拼接成 canonical string: "POST\nParam1=Value1&Param2=Value2..."
+        # 3. HMAC-SHA1 签名后 Base64 编码
+        
+        timestamp = str(int(time.time()))
+        params = {
             "Action": "GetCompShareInstanceMonitor",
             "PublicKey": public_key,
-            "Timestamp": str(int(time.time())),
+            "Timestamp": timestamp,
             "Version": "2018-01-01",
-            "UHostIds.0": uhost_id
         }
         
-        # 计算签名
-        sorted_params = sorted(form_data.items())
-        canonical = "POST\n" + "&".join(f"{k}={v}" for k, v in sorted_params)
-        sig = hmac.new(private_key.encode(), canonical.encode(), hashlib.sha1).digest()
-        form_data["Signature"] = base64.b64encode(sig).decode()
+        # 尝试不同的 UHostIds 格式
+        # UCloud 数组参数通常用 UHostIds.0, UHostIds.1 格式
+        params["UHostIds.0"] = uhost_id
         
-        resp = requests.post(API_BASE_URL, data=form_data)
+        # 排序并拼接
+        sorted_params = sorted(params.items())
+        canonical = "POST\n" + "&".join(f"{k}={v}" for k, v in sorted_params)
+        
+        # 签名
+        sig = hmac.new(
+            private_key.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha1
+        ).digest()
+        params["Signature"] = base64.b64encode(sig).decode("utf-8")
+        
+        resp = requests.post(API_BASE_URL, data=params)
         result = resp.json()
         
         if result.get("RetCode") != 0:

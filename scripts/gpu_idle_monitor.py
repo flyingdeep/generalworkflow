@@ -1,8 +1,6 @@
 """
-GPU Idle Monitor - 检测空跑实例并关闭
-每隔一小时运行，检查运行中实例的 GPU 使用情况，
-如果过去一小时内 GPU 使用率始终低于 5%，则关闭该实例。
-"""
+GPU Idle Monitor - 妫€娴嬬┖璺戝疄渚嬪苟鍏抽棴
+姣忛殧涓€灏忔椂杩愯锛屾鏌ヨ繍琛屼腑瀹炰緥鐨?GPU 浣跨敤鎯呭喌锛?濡傛灉杩囧幓涓€灏忔椂鍐?GPU 浣跨敤鐜囧缁堜綆浜?5%锛屽垯鍏抽棴璇ュ疄渚嬨€?"""
 
 import os
 import sys
@@ -25,10 +23,7 @@ except ImportError:
     sys.exit(1)
 
 API_BASE_URL = "https://api.compshare.cn"
-GPU_THRESHOLD = 5.0  # GPU 使用率阈值（%）
-LOOKBACK_MINUTES = 60  # 查看过去多少分钟的数据
-POLL_INTERVAL_SEC = 15  # 状态轮询间隔
-MAX_RETRIES = 3
+GPU_THRESHOLD = 5.0  # GPU 浣跨敤鐜囬槇鍊硷紙%锛?LOOKBACK_MINUTES = 60  # 鏌ョ湅杩囧幓澶氬皯鍒嗛挓鐨勬暟鎹?POLL_INTERVAL_SEC = 15  # 鐘舵€佽疆璇㈤棿闅?MAX_RETRIES = 3
 RETRY_DELAY_SEC = 5
 
 
@@ -64,12 +59,11 @@ def list_instances(client: Client, limit: int = 100) -> list[dict]:
 
 
 def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[float] | None:
-    """获取实例过去一段时间的 GPU 使用率数据。"""
+    """鑾峰彇瀹炰緥杩囧幓涓€娈垫椂闂寸殑 GPU 浣跨敤鐜囨暟鎹€?""
     try:
-        # 使用SDK自动生成方法而非invoke，避免数组参数序列化问题
-        resp = client.ucompshare().get_comp_share_instance_monitor(
-            Region=region,
-            UHostIds=[uhost_id]
+        resp = client.ucompshare().invoke(
+            "GetCompShareInstanceMonitor",
+            {"Region": region, "UHostIds": [uhost_id]},
         )
         if resp.get("RetCode") != 0:
             logger.warning(f"[{uhost_id}] Monitor API failed: {resp.get('Message')}")
@@ -84,8 +78,7 @@ def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[flo
         inst_data = lst[0]
         metrics = inst_data.get("Metrics", [])
         
-        # 查找 GPU 使用率指标
-        gpu_values = []
+        # 鏌ユ壘 GPU 浣跨敤鐜囨寚鏍?        gpu_values = []
         for metric in metrics:
             key = metric.get("MetricKey", "")
             if key == "cloudwatch_gpu_util":
@@ -104,28 +97,24 @@ def get_gpu_monitor_data(client: Client, uhost_id: str, region: str) -> list[flo
 
 def check_idle(uhost_id: str, region: str, client: Client) -> tuple[bool, str]:
     """
-    检查实例是否空闲（GPU 使用率持续低于阈值）
-    返回: (是否空闲, 原因)
+    妫€鏌ュ疄渚嬫槸鍚︾┖闂诧紙GPU 浣跨敤鐜囨寔缁綆浜庨槇鍊硷級
+    杩斿洖: (鏄惁绌洪棽, 鍘熷洜)
     """
     gpu_values = get_gpu_monitor_data(client, uhost_id, region)
     
     if gpu_values is None:
         return False, "no_data"
     
-    # 过滤掉过去 LOOKBACK_MINUTES 内的数据点
-    cutoff_time = time.time() -LOOKBACK_MINUTES * 60
-    recent_values = [v for v in gpu_values if True]  # API 返回的都是近期数据
-    
+    # 杩囨护鎺夎繃鍘?LOOKBACK_MINUTES 鍐呯殑鏁版嵁鐐?    cutoff_time = time.time() -LOOKBACK_MINUTES * 60
+    recent_values = [v for v in gpu_values if True]  # API 杩斿洖鐨勯兘鏄繎鏈熸暟鎹?    
     if not recent_values:
         return False, "no_recent_data"
     
-    # 检查是否有任意数据点高于阈值
-    max_gpu = max(recent_values)
+    # 妫€鏌ユ槸鍚︽湁浠绘剰鏁版嵁鐐归珮浜庨槇鍊?    max_gpu = max(recent_values)
     min_gpu = min(recent_values)
     avg_gpu = sum(recent_values) / len(recent_values)
     
-    # 如果所有数据点都低于阈值，则认为空闲
-    is_idle = max_gpu < GPU_THRESHOLD
+    # 濡傛灉鎵€鏈夋暟鎹偣閮戒綆浜庨槇鍊硷紝鍒欒涓虹┖闂?    is_idle = max_gpu < GPU_THRESHOLD
     
     reason = (
         f"idle" if is_idle 
@@ -141,7 +130,7 @@ def check_idle(uhost_id: str, region: str, client: Client) -> tuple[bool, str]:
 
 
 def stop_instance(client: Client, uhost_id: str, region: str, zone: str) -> bool:
-    """关闭实例，带重试。"""
+    """鍏抽棴瀹炰緥锛屽甫閲嶈瘯銆?""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = client.ucompshare().invoke(

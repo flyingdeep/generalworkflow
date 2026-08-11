@@ -61,7 +61,7 @@ def list_instances(client: Client, limit: int = 100) -> list[dict]:
 
 
 def ensure_running(client: Client, instance: dict):
-    """Ensure an instance is in Running state (wake if stopped, then shut down)."""
+    """Ensure an instance is in Stopped state (wake if stopped, then shut down; or stop if already running)."""
     uhost_id = instance["UHostId"]
     name = instance.get("Name", "?")
     state = instance.get("State", "?")
@@ -69,11 +69,15 @@ def ensure_running(client: Client, instance: dict):
     zone = instance.get("Zone", "")
 
     if state == "Running":
-        logger.info(f"[{uhost_id}] {name} already Running — skipping")
+        # Instance is already running - stop it to complete the keepalive cycle
+        logger.info(f"[{uhost_id}] {name} is Running — shutting down")
+        if not _stop_instance(client, uhost_id, region, zone):
+            return False
+        logger.info(f"[{uhost_id}] {name} stopped successfully")
         return True
 
     if state in ("Stopped", "stopped"):
-        logger.info(f"{uhost_id}] {name} is Stopped — waking up (WithoutGpuSpec={WITHOUT_GPU_SPEC}, Region={region}, Zone={zone})")
+        logger.info(f"[{uhost_id}] {name} is Stopped — waking up (WithoutGpuSpec={WITHOUT_GPU_SPEC}, Region={region}, Zone={zone}")
         if not _start_instance(client, uhost_id, region, zone):
             return False
         logger.info(f"[{uhost_id}] {name} starting, waiting up to {STARTUP_WAIT_SEC}s for Running...")

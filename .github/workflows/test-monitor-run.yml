@@ -89,50 +89,53 @@ jobs:
               print("Timeout waiting for instance")
               sys.exit(1)
           
-          # Step 3: Test Monitor API
+          # Step 3: Test Monitor API using SDK method
           print(f"\n{'=' * 60}")
-          print("Step 2: Test GetCompShareInstanceMonitor")
+          print("Step 2: Test GetCompShareInstanceMonitor via SDK")
           print("=" * 60)
           
-          monitor_resp = client.ucompshare().invoke(
-              "GetCompShareInstanceMonitor",
-              {"Region": region, "UHostIds": [uhost_id]}
-          )
-          
-          if monitor_resp.get("RetCode") != 0:
-              print(f"Monitor API ERROR: {monitor_resp.get('Message')}")
-              # Don't exit, continue to stop
-          else:
-              data = monitor_resp.get("Data", {})
-              lst = data.get("List", [])
-              if not lst:
-                  print("No monitor data returned")
+          from ucloud.core.exc import RetCodeException
+          try:
+              monitor_resp = client.ucompshare().get_comp_share_instance_monitor(
+                  UHostIds=[uhost_id]
+              )
+              if monitor_resp.get("RetCode") != 0:
+                  print(f"Monitor API ERROR: {monitor_resp.get('Message')}")
               else:
-                  inst_data = lst[0]
-                  metrics = inst_data.get("Metrics", [])
-                  print(f"Metrics returned for {uhost_id}:")
-                  
-                  for metric in metrics:
-                      key = metric.get("MetricKey")
-                      results = metric.get("Results", [])
-                      if results:
-                          values = results[0].get("Values", [])
-                          print(f"\n  {key}: {len(values)} data points")
-                          if values:
-                              # Show first and last values
-                              for j, v in enumerate(values[:5]):
-                                  ts = v.get("Timestamp")
-                                  val = v.get("Value")
-                                  print(f"    [{j}] ts={ts}, value={val}")
-                              if len(values) > 5:
-                                  print(f"    ... ({len(values) - 5} more points)")
-                                  last = values[-1]
-                                  print(f"    [last] ts={last.get('Timestamp')}, value={last.get('Value')}")
+                  data = monitor_resp.get("Data", {})
+                  lst = data.get("List", [])
+                  if not lst:
+                      print("No monitor data returned")
+                  else:
+                      inst_data = lst[0]
+                      metrics = inst_data.get("Metrics", [])
+                      print(f"Metrics returned for {uhost_id}:")
+                      
+                      for metric in metrics:
+                          key = metric.get("MetricKey")
+                          results = metric.get("Results", [])
+                          if results:
+                              values = results[0].get("Values", [])
+                              print(f"\n  {key}: {len(values)} data points")
+                              if values:
+                                  for j, v in enumerate(values[:5]):
+                                      ts = v.get("Timestamp")
+                                      val = v.get("Value")
+                                      print(f"    [{j}] ts={ts}, value={val}")
+                                  if len(values) > 5:
+                                      print(f"    ... ({len(values) - 5} more points)")
+                                      last = values[-1]
+                                      print(f"    [last] ts={last.get('Timestamp')}, value={last.get('Value')}")
+          except RetCodeException as e:
+              print(f"Monitor API exception: {e}")
           
-          # Step 4: Stop the instance
+          # Step 4: Stop the instance (add delay to ensure monitor data is available)
           print(f"\n{'=' * 60}")
-          print("Step 3: Stopping instance")
+          print("Step 3: Stopping instance after waiting for monitor data")
           print("=" * 60)
+          
+          import time
+          time.sleep(10)  # Wait for monitor data to be recorded
           
           stop_resp = client.ucompshare().invoke(
               "StopCompShareInstance",

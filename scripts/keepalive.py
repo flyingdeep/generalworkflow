@@ -75,14 +75,14 @@ def ensure_running(client: Client, instance: dict):
 
     if state in ("Stopped", "stopped"):
         logger.info(f"[{uhost_id}] {name} is Stopped — waking up (WithoutGpuSpec={WITHOUT_GPU_SPEC})")
-        if not _start_instance(client, uhost_id, instance.get("Zone", ZONE)):
+        if not _start_instance(client, uhost_id):
             return False
         logger.info(f"[{uhost_id}] {name} starting, waiting up to {STARTUP_WAIT_SEC}s for Running...")
         if not _wait_for_state(client, uhost_id, "Running", timeout_sec=STARTUP_WAIT_SEC):
             logger.warning(f"[{uhost_id}] {name} did not reach Running within timeout")
             return False
         logger.info(f"[{uhost_id}] {name} is now Running — shutting down")
-        if not _stop_instance(client, uhost_id, instance.get("Zone", ZONE)):
+        if not _stop_instance(client, uhost_id):
             return False
         logger.info(f"[{uhost_id}] {name} stopped successfully")
         return True
@@ -91,14 +91,13 @@ def ensure_running(client: Client, instance: dict):
     return False
 
 
-def _start_instance(client: Client, uhost_id: str, zone: str) -> bool:
+def _start_instance(client: Client, uhost_id: str) -> bool:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = client.ucompshare().invoke(
                 "StartCompShareInstance",
                 {
                     "Region": REGION,
-                    "Zone": zone,
                     "UHostId": uhost_id,
                     "WithoutGpuSpec": WITHOUT_GPU_SPEC,
                 },
@@ -118,12 +117,12 @@ def _start_instance(client: Client, uhost_id: str, zone: str) -> bool:
     return False
 
 
-def _stop_instance(client: Client, uhost_id: str, zone: str) -> bool:
+def _stop_instance(client: Client, uhost_id: str) -> bool:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = client.ucompshare().invoke(
                 "StopCompShareInstance",
-                {"Region": REGION, "Zone": zone, "UHostId": uhost_id},
+                {"Region": REGION, "UHostId": uhost_id},
             )
             if resp.get("RetCode") != 0:
                 logger.error(f"[{uhost_id}] Stop failed (attempt {attempt}): {resp.get('Message')}")

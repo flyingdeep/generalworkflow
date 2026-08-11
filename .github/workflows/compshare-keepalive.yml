@@ -1,0 +1,27 @@
+name: compshare-keepalive
+
+on:
+  schedule:
+    # 每天 4:00 AM 北京时间 (UTC+8) → 00:00 UTC
+    - cron: "0 4 * * *"
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run keepalive script
+        env:
+          COMPSHARE_PUBLIC_KEY: ${{ secrets.COMPSHARE_PUBLIC_KEY }}
+          COMPSHARE_PRIVATE_KEY: ${{ secrets.COMPSHARE_PRIVATE_KEY }}
+        run: python scripts/keepalive.py

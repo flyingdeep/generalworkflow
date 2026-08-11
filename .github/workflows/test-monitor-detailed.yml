@@ -1,0 +1,110 @@
+name: test-monitor-detailed
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install dependencies
+        run: pip install --upgrade ucloud-sdk-python3
+      
+      - name: Detailed Monitor Test
+        env:
+          COMPSHARE_PUBLIC_KEY: ${{ secrets.COMPSHARE_PUBLIC_KEY }}
+          COMPSHARE_PRIVATE_KEY: ${{ secrets.COMPSHARE_PRIVATE_KEY }}
+        run: |
+          cat > /tmp/test_detail.py << 'EOF'
+          import os, sys, time
+          from ucloud.core import exc
+          from ucloud.client import Client
+          
+          client = Client({
+              "region": "",
+              "public_key": os.environ["COMPSHARE_PUBLIC_KEY"],
+              "private_key": os.environ["COMPSHARE_PRIVATE_KEY"],
+              "base_url": "https://api.compshare.cn",
+          })
+          
+          # Find stopped instance
+          resp = client.ucompshare().invoke("DescribeCompShareInstance", {"Limit": 100})
+          if resp.get("RetCode") != 0:
+              print(f"ERROR: {resp.get('Message')}"); sys.exit(1)
+          
+          instances = resp.get("UHostSet", [])
+          target = next((i for i in instances if i.get("State") == "Stopped"), None)
+          if not target:
+              print("No stopped instances"); sys.exit(0)
+          
+          uid, reg, z, name = target["UHostId"], target["Region"], target["Zone"], target["Name"]
+          print(f"Testing: {uid} ({name}) in {reg}/{z}")
+          
+          # Start instance
+          print("Starting...")
+          start = client.ucompshare().invoke("StartCompShareInstance", {"Region": reg, "Zone": z, "UHostId": uid, "WithoutGpuSpec": "A"})
+          if start.get("RetCode") != 0:
+              print(f"Start failed: {start.get('Message')}"); sys.exit(1)
+          
+          # Wait for Running
+          for _ in range(25):
+              time.sleep(15)
+              c = client.ucompshare().invoke("DescribeCompShareInstance", {"Region": reg, "UHostIds": [uid]})
+              if c.get("RetCode") == 0 and c.get("UHostSet") and c["UHostSet"][0].get("State") == "Running":
+                  print("Running!"); break
+          else:
+              print("Timeout"); sys.exit(1)
+          
+          # Wait more for monitoring data
+          print("Waiting for monitoring data (20s)...")
+          time.sleep(20)
+          
+          # Call Monitor API
+          print("\nCalling GetCompShareInstanceMonitor...")
+          try:
+              resp = client.ucompshare().get_comp_share_instance_monitor(UHostIds=[uid])
+              print(f"RetCode: {resp.get('RetCode')}")
+              if resp.get("RetCol") != 0:
+                  print(f"ERROR: {resp.get('Message')}")
+              else:
+                  data = resp.get("Data", {})
+                  lst = data.get("List", [])
+                  print(f"Instances in response: {len(lst)}")
+                  for item in lst:
+                      mid = item.get("UHostId")
+                      metrics = item.get("Metrics", [])
+                      print(f"\n{mid}: {len(metrics)} metrics")
+                      for m in metrics:
+                          key = m.get("MetricKey")
+                          results = m.get("Results", [])
+                          for r in results:
+                              values = r.get("Values", [])
+                              print(f"  {key}: {len(values)} points")
+                              if values:
+                                  # Show all values to check if any > 5%
+                                  max_val = max(v.get("Value", 0) for v in values)
+                                  min_val = min(v.get("Value", 0) for v in values)
+                                  print(f"    min={min_val}, max={max_val}")
+                                  # Show first 3 and last 3
+                                  for j, v in enumerate(values[:3]):
+                                      print(f"      [{j}] ts={v.get('Timestamp')}, val={v.get('Value')}")
+                                  if len(values) > 6:
+                                      print("      ...")
+                                      for j, v in enumerate(values[-3:]):
+                                          print(f"      [{len(values)-3+j}] ts={v.get('Timestamp')}, val={v.get('Value')}")
+          except Exception as e:
+              print(f"Exception: {e}")
+          
+          # Stop instance
+          print("\nStopping...")
+          stop = client.ucompshare().invoke("StopCompShareInstance", {"Region": reg, "Zone": z, "UHostId": uid})
+          print(f"Stop result: {stop.get('RetCode')} - {stop.get('Message', 'OK')}")
+          EOF
+          python /tmp/test_detail.py

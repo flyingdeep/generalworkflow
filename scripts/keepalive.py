@@ -77,7 +77,7 @@ def ensure_running(client: Client, instance: dict):
         if not _start_instance(client, uhost_id, region, zone):
             return False
         logger.info(f"[{uhost_id}] {name} starting, waiting up to {STARTUP_WAIT_SEC}s for Running...")
-        if not _wait_for_state(client, uhost_id, region, timeout_sec=STARTUP_WAIT_SEC):
+        if not _wait_for_state(client, uhost_id, "Running", region, timeout_sec=STARTUP_WAIT_SEC):
             logger.warning(f"[{uhost_id}] {name} did not reach Running within timeout")
             return False
         logger.info(f"[{uhost_id}] {name} is now Running — shutting down")

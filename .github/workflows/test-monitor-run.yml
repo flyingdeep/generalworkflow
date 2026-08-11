@@ -1,0 +1,148 @@
+name: test-monitor-with-running-instance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install dependencies
+        run: pip install --upgrade ucloud-sdk-python3
+      
+      - name: Test Monitor API on Running Instance
+        env:
+          COMPSHARE_PUBLIC_KEY: ${{ secrets.COMPSHARE_PUBLIC_KEY }}
+          COMPSHARE_PRIVATE_KEY: ${{ secrets.COMPSHARE_PRIVATE_KEY }}
+        run: |
+          cat > /tmp/test_monitor_run.py << 'EOF'
+          import os, sys, time
+          from ucloud.core import exc
+          from ucloud.client import Client
+          
+          client = Client({
+              "region": "",
+              "public_key": os.environ["COMPSHARE_PUBLIC_KEY"],
+              "private_key": os.environ["COMPSHARE_PRIVATE_KEY"],
+              "base_url": "https://api.compshare.cn",
+          })
+          
+          # Step 1: Find a stopped instance and start it
+          print("=" * 60)
+          print("Step 1: Find stopped instance and start it")
+          print("=" * 60)
+          
+          resp = client.ucompshare().invoke("DescribeCompShareInstance", {"Limit": 100})
+          if resp.get("RetCode") != 0:
+              print(f"ERROR: {resp.get('Message')}")
+              sys.exit(1)
+          
+          instances = resp.get("UHostSet", [])
+          target = None
+          for inst in instances:
+              if inst.get("State") == "Stopped":
+                  target = inst
+                  break
+          
+          if not target:
+              print("No stopped instances found!")
+              sys.exit(0)
+          
+          uhost_id = target.get("UHostId")
+          region = target.get("Region")
+          zone = target.get("Zone")
+          name = target.get("Name")
+          print(f"Found stopped instance: {uhost_id} ({name}) in {region}/{zone}")
+          
+          # Step 2: Start instance with without-gpu
+          print(f"\nStarting {uhost_id} without GPU...")
+          start_resp = client.ucompshare().invoke(
+              "StartCompShareInstance",
+              {"Region": region, "Zone": zone, "UHostId": uhost_id, "WithoutGpuSpec": "A"}
+          )
+          if start_resp.get("RetCode") != 0:
+              print(f"Start failed: {start_resp.get('Message')}")
+              sys.exit(1)
+          print(f"Start initiated, waiting for Running...")
+          
+          # Wait until Running
+          for i in range(20):
+              time.sleep(15)
+              check = client.ucompshare().invoke(
+                  "DescribeCompShareInstance",
+                  {"Region": region, "UHostIds": [uhost_id]}
+              )
+              if check.get("RetCode") == 0:
+                  insts = check.get("UHostSet", [])
+                  if insts and insts[0].get("State") == "Running":
+                      print(f"Instance is now Running!")
+                      break
+                  print(f"Still waiting... state={insts[0].get('State') if insts else 'N/A'}")
+          else:
+              print("Timeout waiting for instance")
+              sys.exit(1)
+          
+          # Step 3: Test Monitor API
+          print(f"\n{'=' * 60}")
+          print("Step 2: Test GetCompShareInstanceMonitor")
+          print("=" * 60)
+          
+          monitor_resp = client.ucompshare().invoke(
+              "GetCompShareInstanceMonitor",
+              {"Region": region, "UHostIds": [uhost_id]}
+          )
+          
+          if monitor_resp.get("RetCode") != 0:
+              print(f"Monitor API ERROR: {monitor_resp.get('Message')}")
+              # Don't exit, continue to stop
+          else:
+              data = monitor_resp.get("Data", {})
+              lst = data.get("List", [])
+              if not lst:
+                  print("No monitor data returned")
+              else:
+                  inst_data = lst[0]
+                  metrics = inst_data.get("Metrics", [])
+                  print(f"Metrics returned for {uhost_id}:")
+                  
+                  for metric in metrics:
+                      key = metric.get("MetricKey")
+                      results = metric.get("Results", [])
+                      if results:
+                          values = results[0].get("Values", [])
+                          print(f"\n  {key}: {len(values)} data points")
+                          if values:
+                              # Show first and last values
+                              for j, v in enumerate(values[:5]):
+                                  ts = v.get("Timestamp")
+                                  val = v.get("Value")
+                                  print(f"    [{j}] ts={ts}, value={val}")
+                              if len(values) > 5:
+                                  print(f"    ... ({len(values) - 5} more points)")
+                                  last = values[-1]
+                                  print(f"    [last] ts={last.get('Timestamp')}, value={last.get('Value')}")
+          
+          # Step 4: Stop the instance
+          print(f"\n{'=' * 60}")
+          print("Step 3: Stopping instance")
+          print("=" * 60)
+          
+          stop_resp = client.ucompshare().invoke(
+              "StopCompShareInstance",
+              {"Region": region, "Zone": zone, "UHostId": uhost_id}
+          )
+          if stop_resp.get("RetCode") != 0:
+              print(f"Stop failed: {stop_resp.get('Message')}")
+          else:
+              print(f"Instance stopped successfully: {uhost_id}")
+          
+          print("\nTest complete!")
+          EOF
+          python /tmp/test_monitor_run.py

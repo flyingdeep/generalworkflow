@@ -20,8 +20,6 @@ except ImportError:
 
 
 API_BASE_URL = "https://api.compshare.cn"
-REGION = "cn-wlcb"
-ZONE = "cn-wlcb-01"
 POLL_INTERVAL_SEC = 15
 STARTUP_WAIT_SEC = 180  # maximum expected startup time
 MAX_RETRIES = 3
@@ -32,13 +30,12 @@ WITHOUT_GPU_SPEC = "A"
 
 
 def get_client(public_key: str, private_key: str) -> Client:
-    cfg = {
-        "region": REGION,
+    return Client({
+        "region": "",
         "public_key": public_key,
         "private_key": private_key,
         "base_url": API_BASE_URL,
-    }
-    return Client(cfg)
+    })
 
 
 def list_instances(client: Client, limit: int = 100) -> list[dict]:
@@ -48,7 +45,7 @@ def list_instances(client: Client, limit: int = 100) -> list[dict]:
     while True:
         resp = client.ucompshare().invoke(
             "DescribeCompShareInstance",
-            {"Region": REGION, "Limit": limit, "Offset": offset},
+            {"Limit": limit, "Offset": offset},
         )
         if resp.get("RetCode") != 0:
             raise RuntimeError(f"DescribeCompShareInstance failed: {resp.get('Message')}")
@@ -68,21 +65,23 @@ def ensure_running(client: Client, instance: dict):
     uhost_id = instance["UHostId"]
     name = instance.get("Name", "?")
     state = instance.get("State", "?")
+    region = instance.get("Region", "")
+    zone = instance.get("Zone", "")
 
     if state == "Running":
         logger.info(f"[{uhost_id}] {name} already Running — skipping")
         return True
 
     if state in ("Stopped", "stopped"):
-        logger.info(f"[{uhost_id}] {name} is Stopped — waking up (WithoutGpuSpec={WITHOUT_GPU_SPEC})")
-        if not _start_instance(client, uhost_id):
+        logger.info(f"{uhost_id}] {name} is Stopped — waking up (WithoutGpuSpec={WITHOUT_GPU_SPEC}, Region={region}, Zone={zone})")
+        if not _start_instance(client, uhost_id, region, zone):
             return False
         logger.info(f"[{uhost_id}] {name} starting, waiting up to {STARTUP_WAIT_SEC}s for Running...")
-        if not _wait_for_state(client, uhost_id, "Running", timeout_sec=STARTUP_WAIT_SEC):
+        if not _wait_for_state(client, uhost_id, region, timeout_sec=STARTUP_WAIT_SEC):
             logger.warning(f"[{uhost_id}] {name} did not reach Running within timeout")
             return False
         logger.info(f"[{uhost_id}] {name} is now Running — shutting down")
-        if not _stop_instance(client, uhost_id):
+        if not _stop_instance(client, uhost_id, region, zone):
             return False
         logger.info(f"[{uhost_id}] {name} stopped successfully")
         return True
@@ -91,17 +90,13 @@ def ensure_running(client: Client, instance: dict):
     return False
 
 
-def _start_instance(client: Client, uhost_id: str) -> bool:
+def _start_instance(client: Client, uhost_id: str, region: str, zone: str) -> bool:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = client.ucompshare().invoke(
-                "StartCompShareInstance",
-                {
-                    "Region": REGION,
-                    "UHostId": uhost_id,
-                    "WithoutGpuSpec": WITHOUT_GPU_SPEC,
-                },
-            )
+            params = {"Region": region, "UHostId": uhost_id, "WithoutGpuSpec": WITHOUT_GPU_SPEC}
+            if zone:
+                params["Zone"] = zone
+            resp = client.ucompshare().invoke("StartCompShareInstance", params)
             if resp.get("RetCode") != 0:
                 logger.error(f"[{uhost_id}] Start failed (attempt {attempt}): {resp.get('Message')}")
                 if attempt < MAX_RETRIES:
@@ -117,13 +112,13 @@ def _start_instance(client: Client, uhost_id: str) -> bool:
     return False
 
 
-def _stop_instance(client: Client, uhost_id: str) -> bool:
+def _stop_instance(client: Client, uhost_id: str, region: str, zone: str) -> bool:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = client.ucompshare().invoke(
-                "StopCompShareInstance",
-                {"Region": REGION, "UHostId": uhost_id},
-            )
+            params = {"Region": region, "UHostId": uhost_id}
+            if zone:
+                params["Zone"] = zone
+            resp = client.ucompshare().invoke("StopCompShareInstance", params)
             if resp.get("RetCode") != 0:
                 logger.error(f"[{uhost_id}] Stop failed (attempt {attempt}): {resp.get('Message')}")
                 if attempt < MAX_RETRIES:
@@ -139,14 +134,14 @@ def _stop_instance(client: Client, uhost_id: str) -> bool:
     return False
 
 
-def _wait_for_state(client: Client, uhost_id: str, target_state: str, timeout_sec: int = 180) -> bool:
+def _wait_for_state(client: Client, uhost_id: str, target_state: str, region: str, timeout_sec: int = 180) -> bool:
     """Poll DescribeCompShareInstance until the instance reaches target_state or timeout."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         try:
             resp = client.ucompshare().invoke(
                 "DescribeCompShareInstance",
-                {"Region": REGION, "UHostIds": [uhost_id]},
+                {"Region": region, "UHostIds": [uhost_id]},
             )
             if resp.get("RetCode") != 0:
                 logger.warning(f"[{uhost_id}] DescribeCompShareInstance error: {resp.get('Message')}")

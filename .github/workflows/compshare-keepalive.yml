@@ -25,3 +25,4 @@ jobs:
           COMPSHARE_PUBLIC_KEY: ${{ secrets.COMPSHARE_PUBLIC_KEY }}
           COMPSHARE_PRIVATE_KEY: ${{ secrets.COMPSHARE_PRIVATE_KEY }}
         run: python scripts/keepalive.py
+        timeout-minutes: 20

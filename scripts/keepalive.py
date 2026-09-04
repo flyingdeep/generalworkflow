@@ -21,9 +21,11 @@ except ImportError:
 
 API_BASE_URL = "https://api.compshare.cn"
 POLL_INTERVAL_SEC = 15
-STARTUP_WAIT_SEC = 180  # maximum expected startup time
-MAX_RETRIES = 3
+STARTUP_WAIT_SEC = 300  # increased for abnormal states
+MAX_RETRIES = 5  # increased retries
 RETRY_DELAY_SEC = 5
+ABNORMAL_STATES = {"Initializing", "初始化中"}  # states to wait for
+MAX_WAIT_FOR_NORMAL = 600  # max time to wait for instance to become normal
 
 # Without-gpu spec: A = 2核4G, B = 8核16G
 WITHOUT_GPU_SPEC = "A"
@@ -60,6 +62,36 @@ def list_instances(client: Client, limit: int = 100) -> list[dict]:
     return all_instances
 
 
+def _wait_for_normal_state(client, uhost_id, region, timeout_sec=600):
+    """Wait for instance to leave abnormal states like Initializing."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            resp = client.ucompshare().invoke(
+                "DescribeCompShareInstance",
+                {"Region": region, "UHostIds": [uhost_id]},
+            )
+            if resp.get("RetCode") != 0:
+                logger.warning(f"[{uhost_id}] DescribeCompShareInstance error: {resp.get('Message')}")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+            instances = resp.get("UHostSet", [])
+            if not instances:
+                logger.warning(f"[{uhost_id}] Instance not found in response")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+            state = instances[0].get("State", "")
+            if state not in ABNORMAL_STATES:
+                logger.info(f"[{uhost_id}] Instance is now in state: {state}")
+                return True
+            logger.info(f"[{uhost_id}] Waiting for abnormal state to clear: {state}")
+        except exc.UCloudException as e:
+            logger.warning(f"[{uhost_id}] DescribeCompShareInstance exception: {e}")
+        time.sleep(POLL_INTERVAL_SEC)
+    logger.error(f"[{uhost_id}] Timeout waiting for normal state after {timeout_sec}s")
+    return False
+
+
 def ensure_running(client: Client, instance: dict):
     """Ensure an instance is in Stopped state (wake if stopped, then shut down; or stop if already running)."""
     uhost_id = instance["UHostId"]
@@ -67,6 +99,27 @@ def ensure_running(client: Client, instance: dict):
     state = instance.get("State", "?")
     region = instance.get("Region", "")
     zone = instance.get("Zone", "")
+
+    # Handle abnormal states first - wait for them to resolve
+    if state in ABNORMAL_STATES:
+        logger.info(f"[{uhost_id}] {name} is in abnormal state '{state}' — waiting for it to clear")
+        if not _wait_for_normal_state(client, uhost_id, region, timeout_sec=MAX_WAIT_FOR_NORMAL):
+            logger.error(f"[{uhost_id}] {name} stuck in abnormal state '{state}' — skipping")
+            return False
+        # Re-fetch state after waiting
+        resp = client.ucompshare().invoke(
+            "DescribeCompShareInstance",
+            {"Region": region, "UHostIds": [uhost_id]},
+        )
+        if resp.get("RetCode") != 0:
+            logger.error(f"[{uhost_id}] Failed to re-fetch instance state: {resp.get('Message')}")
+            return False
+        instances = resp.get("UHostSet", [])
+        if not instances:
+            logger.error(f"[{uhost_id}] Instance not found after wait")
+            return False
+        state = instances[0].get("State", "?")
+        logger.info(f"[{uhost_id}] {name} state after wait: {state}")
 
     if state == "Running":
         # Instance is already running - stop it to complete the keepalive cycle
@@ -77,7 +130,7 @@ def ensure_running(client: Client, instance: dict):
         return True
 
     if state in ("Stopped", "stopped"):
-        logger.info(f"[{uhost_id}] {name} is Stopped — waking up (WithoutGpuSpec={WITHOUT_GPU_SPEC}, Region={region}, Zone={zone}")
+        logger.info(f"[{uhost_id}] {name} is Stopped — waking up (WithoutGpuSpec={WITHOUT_GPU_SPEC}, Region={region}, Zone={zone})")
         if not _start_instance(client, uhost_id, region, zone):
             return False
         logger.info(f"[{uhost_id}] {name} starting, waiting up to {STARTUP_WAIT_SEC}s for Running...")

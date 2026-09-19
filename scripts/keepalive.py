@@ -59,8 +59,10 @@ MIN_ACTION_BUDGET_SEC = int(os.environ.get("KEEPALIVE_MIN_ACTION_BUDGET_SEC", "3
 # Cap for the initial instance listing, so a slow API cannot eat the whole run.
 LIST_BUDGET_SEC = int(os.environ.get("KEEPALIVE_LIST_BUDGET_SEC", "240"))
 LIST_RETRY_DELAY_SEC = int(os.environ.get("KEEPALIVE_LIST_RETRY_DELAY_SEC", "15"))
-# Parallel workers (each gets its own API client).
-MAX_WORKERS = int(os.environ.get("KEEPALIVE_MAX_WORKERS", "4"))
+# Parallel workers (each gets its own API client). CompShare's 无卡模式 appears to
+# have a limited CPU-only stream pool, so concurrent starts can leave every
+# instance stuck in Initializing — keep this low and raise it only if verified.
+MAX_WORKERS = int(os.environ.get("KEEPALIVE_MAX_WORKERS", "1"))
 # Exit non-zero when any instance could not be cycled, so Actions reports it.
 FAIL_ON_ERROR = os.environ.get("KEEPALIVE_FAIL_ON_ERROR", "true").strip().lower() not in (
     "0", "false", "no", "off",
@@ -419,18 +421,40 @@ def _parse_only(argv: list[str]) -> set[str]:
     return set()
 
 
-def process_instance(public_key: str, private_key: str, instance: dict, global_deadline: float) -> tuple[str, bool]:
+def _dry_run_requested(argv: list[str]) -> bool:
+    """--dry-run only reports instance states and never changes anything."""
+    return "--dry-run" in argv or os.environ.get("KEEPALIVE_DRY_RUN", "").lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def process_instance(public_key: str, private_key: str, instance: dict,
+                     instance_deadline: float) -> tuple[str, bool]:
     """Worker entry point: each instance gets its own client (clients are not thread-safe)."""
     uhost_id = instance.get("UHostId", "?")
     name = instance.get("Name", "?")
     client = get_client(public_key, private_key)
     try:
-        ok = ensure_running(client, instance, global_deadline=global_deadline)
+        ok = ensure_running(client, instance, global_deadline=instance_deadline)
     except Exception as e:  # noqa: BLE001 - never let one instance kill the run
         logger.error(f"[{uhost_id}] {name} unexpected error: {e}")
         ok = False
     logger.info(f"[{uhost_id}] {name} => {'OK' if ok else 'FAILED'}")
     return uhost_id, ok
+
+
+def report_states(client: Client, instances: list[dict]) -> None:
+    """Read-only survey of every instance and the state it is currently in."""
+    logger.info(f"{'INSTANCE':<24} {'NAME':<18} {'REGION':<10} STATE")
+    for inst in instances:
+        uhost_id = inst.get("UHostId", "?")
+        region = inst.get("Region", "")
+        live = describe_instance(client, uhost_id, region)
+        if live is None:
+            state = "<unreachable>"
+        else:
+            state = live.get("State", "?")
+        logger.info(f"{uhost_id:<24} {inst.get('Name', '?'):<18} {region:<10} {state}")
 
 
 def main():
@@ -440,13 +464,15 @@ def main():
         logger.error('Set COMPSHARE_PUBLIC_KEY and COMPSHARE_PRIVATE_KEY environment variables')
         sys.exit(1)
 
+    dry_run = _dry_run_requested(sys.argv[1:])
     only = _parse_only(sys.argv[1:])
     global_deadline = time.time() + GLOBAL_BUDGET_SEC
 
     client = get_client(public_key, private_key)
     logger.info(
-        f"Budget: global={GLOBAL_BUDGET_SEC}s, per-instance={PER_INSTANCE_BUDGET_SEC}s, "
-        f"workers={MAX_WORKERS}, transition-grace={TRANSITION_GRACE_SEC}s"
+        f"Budget: global={GLOBAL_BUDGET_SEC}s, per-instance<= {PER_INSTANCE_BUDGET_SEC}s, "
+        f"workers={MAX_WORKERS}, transition-grace={TRANSITION_GRACE_SEC}s, "
+        f"startup-wait={STARTUP_WAIT_SEC}s, dry-run={dry_run}"
     )
 
     logger.info("Listing all instances...")
@@ -474,28 +500,38 @@ def main():
         logger.info("Nothing to do.")
         return
 
-    workers = max(1, min(MAX_WORKERS, len(instances)))
-    # Reserve room before the global deadline so the final recovery/stop action
-    # still gets a realistic window instead of a zero-length one.
-    reserve = POLL_INTERVAL_SEC + STOP_WAIT_SEC + API_TIMEOUT_SEC
-    worker_deadline = global_deadline - reserve * (1 + 1.0 / workers)
-    if worker_deadline <= time.time():
-        worker_deadline = global_deadline
-
     for inst in instances:
         logger.info(
             f"  - {inst.get('UHostId')} | {inst.get('Name', '?')} | "
             f"state={inst.get('State', '?')} | {inst.get('Region', '?')}"
         )
 
+    if dry_run:
+        report_states(client, instances)
+        logger.info("Dry run finished; no instance was modified.")
+        return
+
+    # Keep the CPU-only stream pool from being over-subscribed (see MAX_WORKERS)
+    # and give every instance a fair share of what is left, so one stubborn
+    # instance cannot consume the whole run. The reserve only needs to cover the
+    # final stop request, not a full startup wait.
+    workers = max(1, min(MAX_WORKERS, len(instances)))
+    reserve = STOP_WAIT_SEC + API_TIMEOUT_SEC
+    available = max(0.0, _remaining(global_deadline) - reserve)
+    fair_share = available / len(instances) if instances else 0.0
+    instance_budget = max(min(PER_INSTANCE_BUDGET_SEC, fair_share), MIN_ACTION_BUDGET_SEC)
+    logger.info(f"Per-instance budget for this run: <= {int(instance_budget)}s "
+                f"(fair share of {int(available)}s across {len(instances)} instances)")
+
     results: dict[str, bool] = {}
     pending = set()
     executor = ThreadPoolExecutor(max_workers=workers)
     try:
-        futures = {
-            executor.submit(process_instance, public_key, private_key, inst, worker_deadline): inst
-            for inst in instances
-        }
+        futures = {}
+        for inst in instances:
+            deadline = min(time.time() + instance_budget, global_deadline)
+            futures[executor.submit(process_instance, public_key, private_key,
+                                    inst, deadline)] = inst
         done, pending = wait(futures, timeout=max(0, _remaining(global_deadline)))
         for future in done:
             inst = futures[future]

@@ -125,9 +125,10 @@ def run_case(name, env_extra, timeout=120):
     env.update({
         "COMPSHARE_PUBLIC_KEY": "fake",
         "COMPSHARE_PRIVATE_KEY": "fake",
-        # Small budgets keep the test fast while still exercising the same code.
-        "KEEPALIVE_GLOBAL_BUDGET_SEC": "20",
-        "KEEPALIVE_PER_INSTANCE_BUDGET_SEC": "12",
+        # Small budgets keep the test fast. main() divides the remaining global
+        # budget evenly across instances, so keep the instance count low.
+        "KEEPALIVE_GLOBAL_BUDGET_SEC": "45",
+        "KEEPALIVE_PER_INSTANCE_BUDGET_SEC": "20",
         "KEEPALIVE_TRANSITION_GRACE_SEC": "2",
         "KEEPALIVE_STARTUP_WAIT_SEC": "2",
         "KEEPALIVE_STOP_WAIT_SEC": "2",
@@ -135,6 +136,7 @@ def run_case(name, env_extra, timeout=120):
         "KEEPALIVE_MAX_WORKERS": "4",
         "KEEPALIVE_MIN_ACTION_BUDGET_SEC": "1",
         "KEEPALIVE_POLL_INTERVAL_SEC": "1",
+        "KEEPALIVE_API_TIMEOUT_SEC": "1",
     })
     env.update(env_extra)
 
@@ -149,6 +151,10 @@ def run_case(name, env_extra, timeout=120):
     finally:
         os.remove(script)
 
+    if os.environ.get("E2E_VERBOSE"):
+        tail = "\n".join(proc.stderr.strip().splitlines()[-30:])
+        print(textwrap.indent(tail, "      "))
+
     return proc, elapsed
 
 
@@ -156,27 +162,30 @@ def main():
     failures = []
 
     # --- Case 1: permanently stuck fleet ------------------------------------
-    print("E2E 1: 4 instances permanently stuck in Initializing")
-    proc, elapsed = run_case("stuck", {"FAKE_MODE": "stuck", "FAKE_INSTANCES": "4"})
+    print("E2E 1: 2 instances permanently stuck in Initializing")
+    proc, elapsed = run_case("stuck", {"FAKE_MODE": "stuck", "FAKE_INSTANCES": "2"})
     results = re.findall(r"RESULT (\S+) (\w+)", proc.stdout)
     print(f"  rc={proc.returncode} elapsed={elapsed:.1f}s results={len(results)}")
     if proc.returncode != 1:
         failures.append(f"E2E 1: expected rc=1, got {proc.returncode}")
     if proc.returncode == 1 and "Traceback" in proc.stderr:
         failures.append("E2E 1: crashed instead of exiting cleanly")
-    if elapsed > 60:
+    if elapsed > 45:
         failures.append(f"E2E 1: did not respect the global budget ({elapsed:.1f}s)")
-    if elapsed < 5:
+    if elapsed < 4:
         failures.append(f"E2E 1: gave up immediately ({elapsed:.1f}s); "
                         "recovery was never attempted")
-    if len(results) != 4:
-        failures.append(f"E2E 1: expected 4 per-instance results, got {len(results)}")
+    if len(results) != 2:
+        failures.append(f"E2E 1: expected 2 per-instance results, got {len(results)}")
     if any(ok == "True" for _, ok in results):
         failures.append("E2E 1: reported success for stuck instances")
+    # The recovery stop must actually have been sent.
+    if "forcing stop to recover" not in proc.stderr:
+        failures.append("E2E 1: no recovery stop was attempted")
 
     # --- Case 2: healthy fleet still works ----------------------------------
-    print("E2E 2: 4 healthy instances (Stopped -> Running -> Stopped)")
-    proc2, elapsed2 = run_case("healthy", {"FAKE_MODE": "healthy", "FAKE_INSTANCES": "4"})
+    print("E2E 2: 2 healthy instances (Stopped -> Running -> Stopped)")
+    proc2, elapsed2 = run_case("healthy", {"FAKE_MODE": "healthy", "FAKE_INSTANCES": "2"})
     results2 = re.findall(r"RESULT (\S+) (\w+)", proc2.stdout)
     print(f"  rc={proc2.returncode} elapsed={elapsed2:.1f}s results={len(results2)}")
     if proc2.returncode != 0:

@@ -5,6 +5,16 @@ on:
     # 每天 4:00 AM 北京时间 (UTC+8) → 00:00 UTC
     - cron: "0 4 * * *"
   workflow_dispatch:  # 支持手动触发
+    inputs:
+      only:
+        description: '仅处理指定实例 ID（逗号分隔，留空=全部）'
+        required: false
+        default: ''
+
+# 同一时间只保留一个 keepalive 运行，避免重复开关机互相干扰
+concurrency:
+  group: compshare-keepalive
+  cancel-in-progress: false
 
 jobs:
   keepalive:
@@ -24,5 +34,14 @@ jobs:
         env:
           COMPSHARE_PUBLIC_KEY: ${{ secrets.COMPSHARE_PUBLIC_KEY }}
           COMPSHARE_PRIVATE_KEY: ${{ secrets.COMPSHARE_PRIVATE_KEY }}
-        run: python scripts/keepalive.py
-        timeout-minutes: 20
+          # 脚本内部的硬预算必须小于 step 超时，保证能自行退出并打印摘要
+          KEEPALIVE_GLOBAL_BUDGET_SEC: "900"
+          KEEPALIVE_PER_INSTANCE_BUDGET_SEC: "540"
+          KEEPALIVE_MAX_WORKERS: "4"
+        run: |
+          if [ -n "${{ inputs.only }}" ]; then
+            python scripts/keepalive.py --only "${{ inputs.only }}"
+          else
+            python scripts/keepalive.py
+          fi
+        timeout-minutes: 18

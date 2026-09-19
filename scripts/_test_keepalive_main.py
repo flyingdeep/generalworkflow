@@ -83,7 +83,7 @@ CHILD = textwrap.dedent(r'''
     sys.path.insert(0, r"__HERE__")
     import keepalive
 
-    keepalive.list_instances = lambda client, limit=100: [
+    keepalive.list_instances = lambda client, limit=100, deadline=None: [
         {"UHostId": "uhost-%d" % i, "Name": "inst-%d" % i,
          "State": "Initializing" if MODE == "stuck" else "Stopped",
          "Region": "cn-wlcb", "Zone": "cn-wlcb-01"}

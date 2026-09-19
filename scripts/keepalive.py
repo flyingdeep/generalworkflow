@@ -31,7 +31,10 @@ API_BASE_URL = "https://api.compshare.cn"
 POLL_INTERVAL_SEC = int(os.environ.get("KEEPALIVE_POLL_INTERVAL_SEC", "10"))
 API_MAX_RETRIES = 3
 API_RETRY_DELAY_SEC = 5
-API_TIMEOUT_SEC = int(os.environ.get("KEEPALIVE_API_TIMEOUT_SEC", "20"))
+# Per-request HTTP timeout. CompShare's list endpoint can legitimately take
+# 20-40s, so this must stay generous; the run-level budgets below are what
+# actually bound the job.
+API_TIMEOUT_SEC = int(os.environ.get("KEEPALIVE_API_TIMEOUT_SEC", "60"))
 
 # Hard cap for a single instance (start + wait + stop + recovery).
 PER_INSTANCE_BUDGET_SEC = int(os.environ.get("KEEPALIVE_PER_INSTANCE_BUDGET_SEC", "540"))
@@ -48,6 +51,9 @@ MAX_RECOVERY_ROUNDS = int(os.environ.get("KEEPALIVE_MAX_ROUNDS", "3"))
 # Minimum remaining budget required before starting another action. Starting a
 # recovery with less time than this only wastes API calls.
 MIN_ACTION_BUDGET_SEC = int(os.environ.get("KEEPALIVE_MIN_ACTION_BUDGET_SEC", "30"))
+# Cap for the initial instance listing, so a slow API cannot eat the whole run.
+LIST_BUDGET_SEC = int(os.environ.get("KEEPALIVE_LIST_BUDGET_SEC", "240"))
+LIST_RETRY_DELAY_SEC = int(os.environ.get("KEEPALIVE_LIST_RETRY_DELAY_SEC", "15"))
 # Parallel workers (each gets its own API client).
 MAX_WORKERS = int(os.environ.get("KEEPALIVE_MAX_WORKERS", "4"))
 # Exit non-zero when any instance could not be cycled, so Actions reports it.
@@ -114,13 +120,13 @@ def get_client(public_key: str, private_key: str) -> Client:
     })
 
 
-def list_instances(client: Client, limit: int = 100) -> list[dict]:
+def list_instances(client: Client, limit: int = 100, deadline: float | None = None) -> list[dict]:
     """Fetch all instances with pagination support."""
     all_instances = []
     offset = 0
     while True:
         resp = _invoke(client, "DescribeCompShareInstance",
-                       {"Limit": limit, "Offset": offset})
+                       {"Limit": limit, "Offset": offset}, deadline=deadline)
         if resp.get("RetCode") != 0:
             raise RuntimeError(f"DescribeCompShareInstance failed: {resp.get('Message')}")
         instances = resp.get("UHostSet", [])
@@ -426,11 +432,21 @@ def main():
     )
 
     logger.info("Listing all instances...")
-    try:
-        instances = list_instances(client)
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"Failed to list instances: {e}")
-        sys.exit(1)
+    list_deadline = min(global_deadline, time.time() + LIST_BUDGET_SEC)
+    instances = []
+    while True:
+        try:
+            instances = list_instances(client, deadline=list_deadline)
+            break
+        except Exception as e:  # noqa: BLE001 - transient API/network failures
+            remaining = _remaining(list_deadline)
+            logger.error(f"Failed to list instances: {e}")
+            if remaining <= LIST_RETRY_DELAY_SEC:
+                logger.error("Giving up on instance listing")
+                sys.exit(1)
+            logger.info(f"Retrying listing in {LIST_RETRY_DELAY_SEC}s "
+                        f"(budget left={int(remaining)}s)")
+            time.sleep(LIST_RETRY_DELAY_SEC)
 
     if only:
         instances = [i for i in instances if i.get("UHostId") in only]

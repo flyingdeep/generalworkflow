@@ -219,50 +219,70 @@ def _inner_budget(deadline: float, cap: float) -> float:
     return max(min(_remaining(deadline) - POLL_INTERVAL_SEC, cap), 0.0)
 
 
-def _recover_instance(client: Client, uhost_id: str, name: str, region: str, zone: str, deadline: float,
-                      force: bool = False) -> bool:
-    """Force the instance back to Stopped, so the normal cycle can restart.
+def _finish_cycle(client: Client, uhost_id: str, name: str, region: str, zone: str,
+                  deadline: float, clock_before: tuple[int, int] | None,
+                  note: str = "") -> bool:
+    """Stop the instance and confirm the reclamation countdown moved forward.
 
-    This is what clears a stuck "Initializing" / "初始化失败" instance: a Stop
-    request on a stuck instance eventually resolves it to Stopped.
-
-    With `force=True` the stop request is always sent, even when the budget is
-    nearly exhausted, and no long wait follows. That keeps the instance in a
-    clean state instead of leaving it stuck mid-transition.
+    Success is judged by the *business* signal (StopTime/ReleaseTime advanced),
+    not by reaching Running. This matters because CompShare's 无卡模式 start can
+    stay in Initializing far longer than any sane wait budget, yet the Stop that
+    follows still refreshes the 7-day reclamation timer — which is the whole
+    point of keepalive.
     """
-    attempts = 2 if not force else 1
-    for attempt in range(1, attempts + 1):
-        if not force and _remaining(deadline) < MIN_ACTION_BUDGET_SEC:
-            logger.error(f"[{uhost_id}] {name} no budget left for recovery")
-            return False
-        logger.info(f"[{uhost_id}] {name} forcing stop to recover (attempt {attempt})")
-        stopped = _stop_instance(client, uhost_id, region, zone, deadline=None)
-        if not stopped:
-            logger.warning(f"[{uhost_id}] {name} stop request was rejected; waiting anyway")
-        if force:
-            return stopped
-        state, _ = wait_for_any_state(
-            client, uhost_id, region, STOPPED_STATES,
-            _inner_budget(deadline, STOP_WAIT_SEC), "Stopped (recovery)"
-        )
-        if state is not None:
-            logger.info(f"[{uhost_id}] {name} recovered to Stopped")
-            return True
-    logger.error(f"[{uhost_id}] {name} recovery failed: never reached Stopped")
+    _stop_instance(client, uhost_id, region, zone, deadline=deadline)
+    state, inst = wait_for_any_state(
+        client, uhost_id, region, STOPPED_STATES,
+        _inner_budget(deadline, STOP_WAIT_SEC), "Stopped"
+    )
+    if inst is None:
+        inst = describe_instance(client, uhost_id, region, deadline=deadline)
+    clock_after = _release_clock(inst)
+    verdict = _reclaim_deadline_advanced(clock_before, clock_after)
+
+    if verdict is True:
+        before_rel, _ = clock_before
+        after_rel, _ = clock_after
+        logger.info(f"[{uhost_id}] {name} keepalive confirmed: release clock "
+                    f"extended{note} (+{int(after_rel - before_rel)}s, "
+                    f"new release={_fmt_ts(after_rel)})")
+        return True
+    if verdict is False:
+        logger.warning(f"[{uhost_id}] {name} release clock did NOT advance"
+                       f"{note} (before={_fmt_ts(clock_before[0])}, "
+                       f"after={_fmt_ts(clock_after[0])})")
+        return False
+
+    # The API did not expose the clocks, so fall back to the state signal.
+    if state is not None:
+        logger.info(f"[{uhost_id}] {name} stopped successfully (release clock not exposed)")
+        return True
+    logger.warning(f"[{uhost_id}] {name} could not be confirmed as stopped{note}")
     return False
 
 
+def _fmt_ts(ts: int) -> str:
+    if not ts:
+        return "n/a"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
 def ensure_running(client: Client, instance: dict, global_deadline: float | None = None) -> bool:
-    """Cycle the instance: Stopped -> Running -> Stopped.
+    """Keep an instance alive and finish with it Stopped.
+
+    The objective is to push back CompShare's 7-day reclamation countdown
+    (ReleaseTime = StopTime + 7 days). Because the countdown is refreshed by the
+    stop, the cycle is: wake the instance, then stop it, then verify that the
+    release clock actually advanced.
 
     Each round re-reads the live state and dispatches:
-      * Running          -> stop, done
-      * Stopped          -> start, wait for Running, stop, done
-      * transitional     -> watch for a short grace period, then force-recover
-      * failed/unknown   -> force-recover immediately (never wait for the default
-                            600s, which is what used to blow the job timeout)
-    All waits are clamped by a hard per-instance and global deadline, so an
-    instance can never extend a run past its budget.
+      * Running          -> stop, verify
+      * Stopped          -> start, wait up to STARTUP_WAIT_SEC for Running,
+                            then stop and verify
+      * transitional     -> watch for a short grace period, then stop and verify
+      * failed/unknown   -> stop and verify immediately
+    All waits are clamped by a hard per-instance and global deadline, so any
+    instance finishes inside its budget even when startup never completes.
     """
     uhost_id = instance["UHostId"]
     name = instance.get("Name", "?")
@@ -272,105 +292,104 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
     budget_deadline = time.time() + PER_INSTANCE_BUDGET_SEC
     deadline = min(budget_deadline, global_deadline) if global_deadline else budget_deadline
 
+    original_clock = _release_clock(instance)
+    if original_clock:
+        logger.info(f"[{uhost_id}] {name} release clock before: "
+                    f"stop={_fmt_ts(original_clock[1])}, release={_fmt_ts(original_clock[0])}")
+
     for round_no in range(1, MAX_RECOVERY_ROUNDS + 1):
         if _remaining(deadline) < MIN_ACTION_BUDGET_SEC:
-            logger.error(f"[{uhost_id}] {name} out of time budget (round {round_no})")
-            _recover_instance(client, uhost_id, name, region, zone, deadline, force=True)
-            return False
+            logger.warning(f"[{uhost_id}] {name} out of time budget (round {round_no})")
+            return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                                 original_clock, note=" [budget-exhausted cleanup]")
 
         inst = describe_instance(client, uhost_id, region, deadline=deadline)
         if inst is None:
-            logger.warning(f"[{uhost_id}] {name} state unknown (describe failed) — recovering")
-            if not _recover_instance(client, uhost_id, name, region, zone, deadline):
-                return False
-            continue
+            logger.warning(f"[{uhost_id}] {name} state unknown — stopping to refresh the clock")
+            return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                                 original_clock, note=" [state-unknown]")
 
         state = inst.get("State", "")
+        clock_before = _release_clock(inst) or original_clock
         logger.info(f"[{uhost_id}] {name} round {round_no}/{MAX_RECOVERY_ROUNDS}, "
                     f"state={state}, budget left={int(_remaining(deadline))}s")
 
-        # 1. Running -> completing the cycle only needs a stop.
+        # 1. Already Running -> the stop half alone completes the keepalive.
         if state in RUNNING_STATES:
             logger.info(f"[{uhost_id}] {name} is Running — shutting down")
-            if not _stop_instance(client, uhost_id, region, zone, deadline=deadline):
-                logger.warning(f"[{uhost_id}] {name} stop request failed — will retry next round")
-                continue
-            settled = _settle_after_stop(client, uhost_id, name, region, deadline)
-            if settled:
-                return True
-            continue
+            return _finish_cycle(client, uhost_id, name, region, zone, deadline, clock_before)
 
-        # 2. Stopped -> wake it up, wait for Running, then stop again.
+        # 2. Stopped -> wake it up first (that is what makes the stop meaningful).
         if state in STOPPED_STATES:
             logger.info(f"[{uhost_id}] {name} is Stopped — waking up "
                         f"(WithoutGpuSpec={WITHOUT_GPU_SPEC}, region={region})")
             if not _start_instance(client, uhost_id, region, zone, deadline=deadline):
-                logger.warning(f"[{uhost_id}] {name} start request failed — recovering")
-                if not _recover_instance(client, uhost_id, name, region, zone, deadline):
-                    return False
-                continue
+                logger.warning(f"[{uhost_id}] {name} start request failed — stopping anyway")
+                return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                                     clock_before, note=" [start-rejected]")
             reached, _ = wait_for_any_state(
                 client, uhost_id, region, RUNNING_STATES,
                 _inner_budget(deadline, STARTUP_WAIT_SEC), "Running"
             )
             if reached is None:
-                logger.warning(f"[{uhost_id}] {name} did not reach Running — recovering")
-                if not _recover_instance(client, uhost_id, name, region, zone, deadline):
-                    return False
-                continue
+                # Slow or stuck startup is expected for heavy community images.
+                # The instance was resumed, so the stop below still refreshes the
+                # reclamation clock — do not fail just because Running was missed.
+                logger.warning(f"[{uhost_id}] {name} did not reach Running within "
+                               f"{STARTUP_WAIT_SEC}s — stopping to refresh the clock")
+                return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                                     clock_before, note=" [startup-slow]")
             logger.info(f"[{uhost_id}] {name} is Running — shutting down")
-            if not _stop_instance(client, uhost_id, region, zone, deadline=deadline):
-                logger.warning(f"[{uhost_id}] {name} stop request failed — will retry next round")
-                continue
-            settled = _settle_after_stop(client, uhost_id, name, region, deadline)
-            if settled:
-                return True
-            continue
+            return _finish_cycle(client, uhost_id, name, region, zone, deadline, clock_before)
 
-        # 3. Failed / abnormal state -> recover at once.
-        if state in FAILED_STATES:
-            logger.warning(f"[{uhost_id}] {name} is in failed state '{state}' — recovering")
-            if not _recover_instance(client, uhost_id, name, region, zone, deadline):
-                return False
-            continue
-
-        # 4. Transitional state -> watch briefly; force recovery if it sticks.
+        # 3. Transitional -> brief grace period, then stop to refresh the clock.
         if state in TRANSITIONAL_STATES:
             logger.info(f"[{uhost_id}] {name} is '{state}' — observing up to {TRANSITION_GRACE_SEC}s")
             reached, _ = wait_for_any_state(
                 client, uhost_id, region, RUNNING_STATES | STOPPED_STATES,
                 _inner_budget(deadline, TRANSITION_GRACE_SEC), "Running/Stopped"
             )
-            if reached is None:
-                logger.warning(f"[{uhost_id}] {name} stuck in '{state}' — recovering")
-                if not _recover_instance(client, uhost_id, name, region, zone, deadline):
-                    return False
-            # Loop again so the freshly observed state is handled normally.
-            continue
+            if reached in RUNNING_STATES:
+                logger.info(f"[{uhost_id}] {name} reached Running — shutting down")
+            else:
+                logger.warning(f"[{uhost_id}] {name} still '{state}' — stopping to refresh the clock")
+            return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                                 clock_before,
+                                 note="" if reached in RUNNING_STATES else " [transitional]")
 
-        # 5. Anything else -> treat as abnormal and recover.
-        logger.warning(f"[{uhost_id}] {name} unexpected state '{state}' — recovering")
-        if not _recover_instance(client, uhost_id, name, region, zone, deadline):
-            return False
-        continue
+        # 4. Failed / unknown state -> stop to refresh the clock.
+        logger.warning(f"[{uhost_id}] {name} state '{state}' — stopping to refresh the clock")
+        return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                             clock_before, note=" [abnormal-state]")
 
-    logger.error(f"[{uhost_id}] {name} exhausted {MAX_RECOVERY_ROUNDS} rounds without cycling")
-    # Best effort: leave the instance Stopped rather than stuck mid-transition,
-    # which keeps the next scheduled run on a clean footing.
-    _recover_instance(client, uhost_id, name, region, zone, deadline, force=True)
+    logger.error(f"[{uhost_id}] {name} exhausted rounds without confirming keepalive")
     return False
 
 
-def _settle_after_stop(client: Client, uhost_id: str, name: str, region: str, deadline: float) -> str:
-    """Return the state after a stop request, waiting for it to settle."""
-    state, _ = wait_for_any_state(
-        client, uhost_id, region, STOPPED_STATES,
-        _inner_budget(deadline, STOP_WAIT_SEC), "Stopped"
-    )
-    if state is None:
-        return ""
-    logger.info(f"[{uhost_id}] {name} stopped successfully")
-    return state
+def _release_clock(inst: dict | None) -> tuple[int, int] | None:
+    """Return (ReleaseTime, StopTime) when the API exposes them.
+
+    The keepalive goal is not "the instance reached Running" — it is "the
+    reclamation countdown was pushed back". CompShare sets
+    ReleaseTime = StopTime + 7 days, so an advanced StopTime/ReleaseTime proves
+    the instance was kept alive. Returns None when the API omits both fields
+    (then callers fall back to state-based success).
+    """
+    if not inst:
+        return None
+    release = inst.get("ReleaseTime")
+    stop = inst.get("StopTime")
+    if not release and not stop:
+        return None
+    return int(release or 0), int(stop or 0)
+
+
+def _reclaim_deadline_advanced(before: tuple[int, int] | None,
+                               after: tuple[int, int] | None) -> bool | None:
+    """True/False when both clocks are known, None when unverifiable."""
+    if before is None or after is None:
+        return None
+    return after[0] > before[0] or after[1] > before[1]
 
 
 def _start_instance(client: Client, uhost_id: str, region: str, zone: str,

@@ -37,16 +37,19 @@ CHILD = textwrap.dedent(r'''
 
     MODE = os.environ.get("FAKE_MODE", "stuck")
     INSTANCES = int(os.environ.get("FAKE_INSTANCES", "4"))
+    SEVEN_DAYS = 7 * 24 * 3600
 
-    # Live state per instance, so healthy mode can model real transitions:
-    # stop/start immediately yield Stopped/Running.
+    # Live state and release clocks per instance, so the fake can model the real
+    # contract: a stop refreshes StopTime and pushes ReleaseTime 7 days out.
     STATE = {}
+    CLOCKS = {}
+    NOW = [1_800_000_000]
 
     class _UCompshare:
-        def _state_of(self, uhost_id):
+        def _ensure(self, uhost_id):
             if uhost_id not in STATE:
                 STATE[uhost_id] = "Initializing" if MODE == "stuck" else "Stopped"
-            return STATE[uhost_id]
+                CLOCKS[uhost_id] = [NOW[0] - SEVEN_DAYS, NOW[0]]
 
         def invoke(self, action, params):
             if action == "DescribeCompShareInstance":
@@ -54,15 +57,30 @@ CHILD = textwrap.dedent(r'''
                     # Page listing used by list_instances().
                     return {"RetCode": 0, "TotalCount": INSTANCES, "UHostSet": []}
                 uhost_id = params["UHostIds"][0]
-                return {"RetCode": 0, "UHostSet": [
-                    {"State": self._state_of(uhost_id), "UHostId": uhost_id}]}
+                self._ensure(uhost_id)
+                stop_time, release_time = CLOCKS[uhost_id]
+                return {"RetCode": 0, "UHostSet": [{
+                    "State": STATE[uhost_id], "UHostId": uhost_id,
+                    "StopTime": stop_time, "ReleaseTime": release_time}]}
             if action == "StartCompShareInstance":
+                uhost_id = params["UHostId"]
+                self._ensure(uhost_id)
                 if MODE != "stuck":
-                    STATE[params["UHostId"]] = "Running"
+                    STATE[uhost_id] = "Running"
                 return {"RetCode": 0}
             if action == "StopCompShareInstance":
-                if MODE != "stuck":
-                    STATE[params["UHostId"]] = "Stopped"
+                uhost_id = params["UHostId"]
+                self._ensure(uhost_id)
+                # "stuck": the instance never reaches Running and ignores the
+                # stop, yet the real platform still refreshes the reclamation
+                # clock — that is exactly the production case we must not fail.
+                if MODE == "healthy":
+                    STATE[uhost_id] = "Stopped"
+                # "frozen" models a stop that is accepted but never refreshes the
+                # reclamation clock, which must be reported as a real failure.
+                if MODE != "frozen":
+                    NOW[0] += 60
+                    CLOCKS[uhost_id] = [NOW[0], NOW[0] + SEVEN_DAYS]
                 return {"RetCode": 0}
             return {"RetCode": 0, "UHostSet": [], "TotalCount": 0}
 
@@ -92,9 +110,8 @@ CHILD = textwrap.dedent(r'''
 
     calls = {"start": 0, "stop": 0}
 
-    if MODE == "stuck":
-        # A stuck instance ignores both requests, so every recovery must time out
-        # on its own instead of hanging forever.
+    if MODE == "unresponsive":
+        # API calls fail outright, so the run must stay bounded and report failure.
         def _noop_stop(*a, **k):
             calls["stop"] += 1
             return False
@@ -161,27 +178,21 @@ def run_case(name, env_extra, timeout=120):
 def main():
     failures = []
 
-    # --- Case 1: permanently stuck fleet ------------------------------------
-    print("E2E 1: 2 instances permanently stuck in Initializing")
+    # --- Case 1: start never completes, but the stop still refreshes clocks --
+    print("E2E 1: 2 instances whose start never reaches Running")
     proc, elapsed = run_case("stuck", {"FAKE_MODE": "stuck", "FAKE_INSTANCES": "2"})
     results = re.findall(r"RESULT (\S+) (\w+)", proc.stdout)
     print(f"  rc={proc.returncode} elapsed={elapsed:.1f}s results={len(results)}")
-    if proc.returncode != 1:
-        failures.append(f"E2E 1: expected rc=1, got {proc.returncode}")
-    if proc.returncode == 1 and "Traceback" in proc.stderr:
-        failures.append("E2E 1: crashed instead of exiting cleanly")
+    if proc.returncode != 0:
+        failures.append(f"E2E 1: expected rc=0 (clock still refreshed), got {proc.returncode}")
     if elapsed > 45:
         failures.append(f"E2E 1: did not respect the global budget ({elapsed:.1f}s)")
-    if elapsed < 4:
-        failures.append(f"E2E 1: gave up immediately ({elapsed:.1f}s); "
-                        "recovery was never attempted")
     if len(results) != 2:
         failures.append(f"E2E 1: expected 2 per-instance results, got {len(results)}")
-    if any(ok == "True" for _, ok in results):
-        failures.append("E2E 1: reported success for stuck instances")
-    # The recovery stop must actually have been sent.
-    if "forcing stop to recover" not in proc.stderr:
-        failures.append("E2E 1: no recovery stop was attempted")
+    if any(ok != "True" for _, ok in results):
+        failures.append(f"E2E 1: should report keepalive success: {results}")
+    if "keepalive confirmed" not in proc.stderr:
+        failures.append("E2E 1: success was not justified by the release clock")
 
     # --- Case 2: healthy fleet still works ----------------------------------
     print("E2E 2: 2 healthy instances (Stopped -> Running -> Stopped)")
@@ -192,6 +203,16 @@ def main():
         failures.append(f"E2E 2: expected rc=0, got {proc2.returncode}")
     if not results2 or any(ok != "True" for _, ok in results2):
         failures.append(f"E2E 2: not all instances reported OK: {results2}")
+
+    # --- Case 3: the clock never moves -> genuine failure, non-zero exit -----
+    print("E2E 3: 2 instances whose release clock never advances")
+    proc3, elapsed3 = run_case("frozen", {"FAKE_MODE": "frozen", "FAKE_INSTANCES": "2"})
+    results3 = re.findall(r"RESULT (\S+) (\w+)", proc3.stdout)
+    print(f"  rc={proc3.returncode} elapsed={elapsed3:.1f}s results={len(results3)}")
+    if proc3.returncode != 1:
+        failures.append(f"E2E 3: expected rc=1, got {proc3.returncode}")
+    if any(ok == "True" for _, ok in results3):
+        failures.append(f"E2E 3: must not claim success when the clock is frozen: {results3}")
 
     print()
     if failures:

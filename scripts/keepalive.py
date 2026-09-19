@@ -243,8 +243,9 @@ def _finish_cycle(client: Client, uhost_id: str, name: str, region: str, zone: s
     if verdict is True:
         before_rel, _ = clock_before
         after_rel, _ = clock_after
+        delta = f"+{int(after_rel - before_rel)}s" if before_rel and after_rel else "advanced"
         logger.info(f"[{uhost_id}] {name} keepalive confirmed: release clock "
-                    f"extended{note} (+{int(after_rel - before_rel)}s, "
+                    f"extended{note} ({delta}, "
                     f"new release={_fmt_ts(after_rel)})")
         return True
     if verdict is False:
@@ -267,7 +268,8 @@ def _fmt_ts(ts: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def ensure_running(client: Client, instance: dict, global_deadline: float | None = None) -> bool:
+def ensure_running(client: Client, instance: dict, global_deadline: float | None = None,
+                   instance_budget: float | None = None) -> bool:
     """Keep an instance alive and finish with it Stopped.
 
     The objective is to push back CompShare's 7-day reclamation countdown
@@ -289,8 +291,21 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
     region = instance.get("Region", "")
     zone = instance.get("Zone", "")
 
-    budget_deadline = time.time() + PER_INSTANCE_BUDGET_SEC
-    deadline = min(budget_deadline, global_deadline) if global_deadline else budget_deadline
+    # Both the start waiting and the final cleanup need their own room, so the
+    # action deadline is smaller than the overall instance deadline. Without this
+    # split a slow startup would leave nothing for the stop that actually
+    # refreshes the reclamation clock.
+    budget = PER_INSTANCE_BUDGET_SEC if instance_budget is None else instance_budget
+    instance_deadline = time.time() + budget
+    if global_deadline:
+        instance_deadline = min(instance_deadline, global_deadline)
+    cleanup_reserve = min(STOP_WAIT_SEC, max(10, budget * 0.3))
+    deadline = instance_deadline - cleanup_reserve
+    if deadline <= time.time():
+        # Too late to start anything: still do the best-effort cleanup.
+        logger.warning(f"[{uhost_id}] {name} no time left to cycle; cleanup only")
+        return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
+                             _release_clock(instance), note=" [no-budget]")
 
     original_clock = _release_clock(instance)
     if original_clock:
@@ -299,14 +314,14 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
 
     for round_no in range(1, MAX_RECOVERY_ROUNDS + 1):
         if _remaining(deadline) < MIN_ACTION_BUDGET_SEC:
-            logger.warning(f"[{uhost_id}] {name} out of time budget (round {round_no})")
-            return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+            logger.warning(f"[{uhost_id}] {name} out of action budget (round {round_no})")
+            return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
                                  original_clock, note=" [budget-exhausted cleanup]")
 
         inst = describe_instance(client, uhost_id, region, deadline=deadline)
         if inst is None:
             logger.warning(f"[{uhost_id}] {name} state unknown — stopping to refresh the clock")
-            return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+            return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
                                  original_clock, note=" [state-unknown]")
 
         state = inst.get("State", "")
@@ -317,7 +332,8 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
         # 1. Already Running -> the stop half alone completes the keepalive.
         if state in RUNNING_STATES:
             logger.info(f"[{uhost_id}] {name} is Running — shutting down")
-            return _finish_cycle(client, uhost_id, name, region, zone, deadline, clock_before)
+            return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
+                                 clock_before)
 
         # 2. Stopped -> wake it up first (that is what makes the stop meaningful).
         if state in STOPPED_STATES:
@@ -325,7 +341,7 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
                         f"(WithoutGpuSpec={WITHOUT_GPU_SPEC}, region={region})")
             if not _start_instance(client, uhost_id, region, zone, deadline=deadline):
                 logger.warning(f"[{uhost_id}] {name} start request failed — stopping anyway")
-                return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
                                      clock_before, note=" [start-rejected]")
             reached, _ = wait_for_any_state(
                 client, uhost_id, region, RUNNING_STATES,
@@ -337,10 +353,11 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
                 # reclamation clock — do not fail just because Running was missed.
                 logger.warning(f"[{uhost_id}] {name} did not reach Running within "
                                f"{STARTUP_WAIT_SEC}s — stopping to refresh the clock")
-                return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+                return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
                                      clock_before, note=" [startup-slow]")
             logger.info(f"[{uhost_id}] {name} is Running — shutting down")
-            return _finish_cycle(client, uhost_id, name, region, zone, deadline, clock_before)
+            return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
+                                 clock_before)
 
         # 3. Transitional -> brief grace period, then stop to refresh the clock.
         if state in TRANSITIONAL_STATES:
@@ -353,13 +370,13 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
                 logger.info(f"[{uhost_id}] {name} reached Running — shutting down")
             else:
                 logger.warning(f"[{uhost_id}] {name} still '{state}' — stopping to refresh the clock")
-            return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+            return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
                                  clock_before,
                                  note="" if reached in RUNNING_STATES else " [transitional]")
 
         # 4. Failed / unknown state -> stop to refresh the clock.
         logger.warning(f"[{uhost_id}] {name} state '{state}' — stopping to refresh the clock")
-        return _finish_cycle(client, uhost_id, name, region, zone, deadline,
+        return _finish_cycle(client, uhost_id, name, region, zone, instance_deadline,
                              clock_before, note=" [abnormal-state]")
 
     logger.error(f"[{uhost_id}] {name} exhausted rounds without confirming keepalive")
@@ -448,13 +465,20 @@ def _dry_run_requested(argv: list[str]) -> bool:
 
 
 def process_instance(public_key: str, private_key: str, instance: dict,
-                     instance_deadline: float) -> tuple[str, bool]:
-    """Worker entry point: each instance gets its own client (clients are not thread-safe)."""
+                     global_deadline: float, instance_budget: float) -> tuple[str, bool]:
+    """Worker entry point: each instance gets its own client (clients are not thread-safe).
+
+    `instance_budget` is applied here, at the moment the instance is actually
+    processed, rather than when the task was queued. With serial workers the
+    queueing delay can be many minutes, so a deadline computed at submit time
+    would leave the later instances with no usable budget at all.
+    """
     uhost_id = instance.get("UHostId", "?")
     name = instance.get("Name", "?")
     client = get_client(public_key, private_key)
     try:
-        ok = ensure_running(client, instance, global_deadline=instance_deadline)
+        ok = ensure_running(client, instance, global_deadline=global_deadline,
+                            instance_budget=instance_budget)
     except Exception as e:  # noqa: BLE001 - never let one instance kill the run
         logger.error(f"[{uhost_id}] {name} unexpected error: {e}")
         ok = False
@@ -546,11 +570,11 @@ def main():
     pending = set()
     executor = ThreadPoolExecutor(max_workers=workers)
     try:
-        futures = {}
-        for inst in instances:
-            deadline = min(time.time() + instance_budget, global_deadline)
-            futures[executor.submit(process_instance, public_key, private_key,
-                                    inst, deadline)] = inst
+        futures = {
+            executor.submit(process_instance, public_key, private_key, inst,
+                            global_deadline, instance_budget): inst
+            for inst in instances
+        }
         done, pending = wait(futures, timeout=max(0, _remaining(global_deadline)))
         for future in done:
             inst = futures[future]

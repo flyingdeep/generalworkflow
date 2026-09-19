@@ -48,7 +48,18 @@ CHILD = textwrap.dedent(r'''
     class _UCompshare:
         def _ensure(self, uhost_id):
             if uhost_id not in STATE:
-                STATE[uhost_id] = "Initializing" if MODE == "stuck" else "Stopped"
+                # "slow" instances model the heavy-image case: the start is
+                # accepted but Running is never reported. The first one is slow,
+                # the rest are instant, so the serial queue is drained quickly
+                # while still exercising the queueing path.
+                if MODE == "slow" and uhost_id.endswith("-0"):
+                    STATE[uhost_id] = "Initializing"
+                elif MODE == "stuck":
+                    STATE[uhost_id] = "Initializing"
+                elif MODE == "running":
+                    STATE[uhost_id] = "Running"
+                else:
+                    STATE[uhost_id] = "Stopped"
                 CLOCKS[uhost_id] = [NOW[0] - SEVEN_DAYS, NOW[0]]
 
         def invoke(self, action, params):
@@ -65,16 +76,19 @@ CHILD = textwrap.dedent(r'''
             if action == "StartCompShareInstance":
                 uhost_id = params["UHostId"]
                 self._ensure(uhost_id)
-                if MODE != "stuck":
+                # In "slow"/"stuck" mode instance 0 never reports Running.
+                if MODE == "stuck" or (MODE == "slow" and uhost_id.endswith("-0")):
+                    STATE[uhost_id] = "Initializing"
+                else:
                     STATE[uhost_id] = "Running"
                 return {"RetCode": 0}
             if action == "StopCompShareInstance":
                 uhost_id = params["UHostId"]
                 self._ensure(uhost_id)
-                # "stuck": the instance never reaches Running and ignores the
-                # stop, yet the real platform still refreshes the reclamation
-                # clock — that is exactly the production case we must not fail.
-                if MODE == "healthy":
+                # "stuck"/"slow" instances ignore the stop state-wise, yet the
+                # real platform still refreshes the reclamation clock — exactly
+                # the production case that must not be reported as a failure.
+                if MODE in ("healthy", "running"):
                     STATE[uhost_id] = "Stopped"
                 # "frozen" models a stop that is accepted but never refreshes the
                 # reclamation clock, which must be reported as a real failure.
@@ -126,8 +140,9 @@ CHILD = textwrap.dedent(r'''
     # Report what happened on a dedicated line the parent can parse.
     real_ensure = keepalive.ensure_running
 
-    def _wrapped(client, instance, global_deadline=None):
-        ok = real_ensure(client, instance, global_deadline=global_deadline)
+    def _wrapped(client, instance, global_deadline=None, instance_budget=None):
+        ok = real_ensure(client, instance, global_deadline=global_deadline,
+                         instance_budget=instance_budget)
         print("RESULT %s %s" % (instance.get("UHostId"), ok), flush=True)
         return ok
 
@@ -213,6 +228,32 @@ def main():
         failures.append(f"E2E 3: expected rc=1, got {proc3.returncode}")
     if any(ok == "True" for _, ok in results3):
         failures.append(f"E2E 3: must not claim success when the clock is frozen: {results3}")
+
+    # --- Case 4: serial queueing must not starve later instances ------------
+    # Regression: the per-instance deadline used to be computed when the task was
+    # submitted. With workers=1 the later tasks therefore started already expired
+    # and failed instantly (observed in run 35455603446 for "Comfy").
+    # The budgets below are tuned so the first instance consumes more than one
+    # per-instance share, which is exactly what starved the queue before.
+    print("E2E 4: 4 instances, serial queue, first one stalls on startup")
+    proc4, elapsed4 = run_case("slow", {
+        "FAKE_MODE": "slow", "FAKE_INSTANCES": "4",
+        # Force serial processing: the starvation bug only exists when tasks queue.
+        "KEEPALIVE_MAX_WORKERS": "1",
+        "KEEPALIVE_GLOBAL_BUDGET_SEC": "30",
+        "KEEPALIVE_STARTUP_WAIT_SEC": "8",
+        "KEEPALIVE_TRANSITION_GRACE_SEC": "8",
+    })
+    results4 = re.findall(r"RESULT (\S+) (\w+)", proc4.stdout)
+    print(f"  rc={proc4.returncode} elapsed={elapsed4:.1f}s results={len(results4)}")
+    if proc4.returncode != 0:
+        failures.append(f"E2E 4: expected rc=0, got {proc4.returncode}")
+    if len(results4) != 4:
+        failures.append(f"E2E 4: expected 4 results, got {len(results4)}")
+    if any(ok != "True" for _, ok in results4):
+        failures.append(f"E2E 4: queued instances were starved of budget: {results4}")
+    if "no time left to cycle" in proc4.stderr:
+        failures.append("E2E 4: a queued instance started with an expired deadline")
 
     print()
     if failures:

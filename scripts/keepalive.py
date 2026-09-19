@@ -42,12 +42,17 @@ PER_INSTANCE_BUDGET_SEC = int(os.environ.get("KEEPALIVE_PER_INSTANCE_BUDGET_SEC"
 GLOBAL_BUDGET_SEC = int(os.environ.get("KEEPALIVE_GLOBAL_BUDGET_SEC", "900"))
 # How long to passively watch a transitional state before forcing a recovery.
 TRANSITION_GRACE_SEC = int(os.environ.get("KEEPALIVE_TRANSITION_GRACE_SEC", "90"))
-# How long to wait for Running after a successful Start call.
-STARTUP_WAIT_SEC = int(os.environ.get("KEEPALIVE_STARTUP_WAIT_SEC", "180"))
+# How long to wait for Running after a successful Start call. Real "无卡模式"
+# starts of heavy community images (e.g. Minimax/ComfyUI) routinely exceed 3
+# minutes, so this must stay generous while remaining under the per-instance
+# budget together with the stop and recovery windows.
+STARTUP_WAIT_SEC = int(os.environ.get("KEEPALIVE_STARTUP_WAIT_SEC", "300"))
 # How long to wait for Stopped after a successful Stop call.
 STOP_WAIT_SEC = int(os.environ.get("KEEPALIVE_STOP_WAIT_SEC", "150"))
-# Rounds of "act -> observe -> recover" per instance.
-MAX_RECOVERY_ROUNDS = int(os.environ.get("KEEPALIVE_MAX_ROUNDS", "3"))
+# Rounds of "act -> observe -> recover" per instance. Each round can consume a
+# full STARTUP_WAIT_SEC, so this stays small to avoid burning the global budget
+# on a single stubborn instance.
+MAX_RECOVERY_ROUNDS = int(os.environ.get("KEEPALIVE_MAX_ROUNDS", "2"))
 # Minimum remaining budget required before starting another action. Starting a
 # recovery with less time than this only wastes API calls.
 MIN_ACTION_BUDGET_SEC = int(os.environ.get("KEEPALIVE_MIN_ACTION_BUDGET_SEC", "30"))
@@ -212,20 +217,28 @@ def _inner_budget(deadline: float, cap: float) -> float:
     return max(min(_remaining(deadline) - POLL_INTERVAL_SEC, cap), 0.0)
 
 
-def _recover_instance(client: Client, uhost_id: str, name: str, region: str, zone: str, deadline: float) -> bool:
+def _recover_instance(client: Client, uhost_id: str, name: str, region: str, zone: str, deadline: float,
+                      force: bool = False) -> bool:
     """Force the instance back to Stopped, so the normal cycle can restart.
 
     This is what clears a stuck "Initializing" / "初始化失败" instance: a Stop
     request on a stuck instance eventually resolves it to Stopped.
+
+    With `force=True` the stop request is always sent, even when the budget is
+    nearly exhausted, and no long wait follows. That keeps the instance in a
+    clean state instead of leaving it stuck mid-transition.
     """
-    for attempt in range(1, 3):
-        if _remaining(deadline) < MIN_ACTION_BUDGET_SEC:
+    attempts = 2 if not force else 1
+    for attempt in range(1, attempts + 1):
+        if not force and _remaining(deadline) < MIN_ACTION_BUDGET_SEC:
             logger.error(f"[{uhost_id}] {name} no budget left for recovery")
             return False
         logger.info(f"[{uhost_id}] {name} forcing stop to recover (attempt {attempt})")
-        stopped = _stop_instance(client, uhost_id, region, zone, deadline=deadline)
+        stopped = _stop_instance(client, uhost_id, region, zone, deadline=None)
         if not stopped:
             logger.warning(f"[{uhost_id}] {name} stop request was rejected; waiting anyway")
+        if force:
+            return stopped
         state, _ = wait_for_any_state(
             client, uhost_id, region, STOPPED_STATES,
             _inner_budget(deadline, STOP_WAIT_SEC), "Stopped (recovery)"
@@ -260,6 +273,7 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
     for round_no in range(1, MAX_RECOVERY_ROUNDS + 1):
         if _remaining(deadline) < MIN_ACTION_BUDGET_SEC:
             logger.error(f"[{uhost_id}] {name} out of time budget (round {round_no})")
+            _recover_instance(client, uhost_id, name, region, zone, deadline, force=True)
             return False
 
         inst = describe_instance(client, uhost_id, region, deadline=deadline)
@@ -339,6 +353,9 @@ def ensure_running(client: Client, instance: dict, global_deadline: float | None
         continue
 
     logger.error(f"[{uhost_id}] {name} exhausted {MAX_RECOVERY_ROUNDS} rounds without cycling")
+    # Best effort: leave the instance Stopped rather than stuck mid-transition,
+    # which keeps the next scheduled run on a clean footing.
+    _recover_instance(client, uhost_id, name, region, zone, deadline, force=True)
     return False
 
 
@@ -375,11 +392,12 @@ def _start_instance(client: Client, uhost_id: str, region: str, zone: str,
 
 
 def _stop_instance(client: Client, uhost_id: str, region: str, zone: str,
-                   deadline: float | None = None) -> bool:
+                   deadline: float | None = None, max_attempts: int = API_MAX_RETRIES) -> bool:
     params = {"Region": region, "UHostId": uhost_id}
     if zone:
         params["Zone"] = zone
-    resp = _invoke(client, "StopCompShareInstance", params, deadline=deadline)
+    resp = _invoke(client, "StopCompShareInstance", params,
+                   deadline=deadline, max_attempts=max_attempts)
     if resp.get("RetCode") == 0:
         logger.info(f"[{uhost_id}] StopCompShareInstance OK")
         return True

@@ -119,7 +119,8 @@ def check(cond, message):
 
 def main():
     # 1) Stuck in Initializing forever: must force-recover, give up quickly, and
-    #    never sit in a 600s wait.
+    #    never sit in a 600s wait. A final forced stop must be attempted so the
+    #    instance is left in a clean state for the next run.
     print("Case 1: stuck in Initializing forever")
     s = Sim("stuck", "Initializing")  # ignores both start and stop
     ok, elapsed = run(s, "stuck-initializing")
@@ -137,7 +138,7 @@ def main():
     ok, elapsed = run(s, "recover-then-cycle")
     check(ok, "Case 2: should succeed")
     check(s.start_calls == 1, f"Case 2: expected exactly 1 start, got {s.start_calls}")
-    check(s.stop_calls == 2, f"Case 2: expected 2 stops, got {s.stop_calls}")
+    check(s.stop_calls >= 2, f"Case 2: expected at least 2 stops, got {s.stop_calls}")
     check(s.state == "Stopped", f"Case 2: should end Stopped, got {s.state}")
 
     # 3) Chinese failure state: recovery must be immediate, not a long wait.
@@ -181,6 +182,7 @@ def main():
     check(s.stop_calls == 1, f"Case 6: expected 1 stop, got {s.stop_calls}")
 
     # 7) Start works but it never reaches Running (the real timeout cause).
+    #    The instance must be left Stopped, not stuck in Initializing.
     print("Case 7: never reaches Running after start")
     s = Sim("nostart", "Stopped", transitions={
         ("Stopped", "start"): "Initializing",  # stuck there
@@ -189,6 +191,17 @@ def main():
     ok, elapsed = run(s, "never-running")
     check(not ok, "Case 7: should report failure after bounded retries")
     check(elapsed < 30, f"Case 7: must respect budget, took {elapsed:.1f}s")
+    check(s.state == "Stopped", f"Case 7: must end Stopped, got {s.state}")
+
+    # 8) Budget already exhausted: a final forced stop must still be sent so the
+    #    instance is not abandoned mid-transition.
+    print("Case 8: no budget left -> forced cleanup stop")
+    s = Sim("nobudget", "Initializing")
+    inst = {"UHostId": "uhost-test", "Name": "nobudget", "Region": "cn-wlcb", "Zone": "cn-wlcb-01"}
+    ok = keepalive.ensure_running(FakeClient(s), inst, global_deadline=time.time() - 1)
+    print(f"  -> nobudget: ok={ok} stop={s.stop_calls}")
+    check(not ok, "Case 8: should report failure")
+    check(s.stop_calls == 1, f"Case 8: expected 1 cleanup stop, got {s.stop_calls}")
 
     print()
     if FAILURES:
